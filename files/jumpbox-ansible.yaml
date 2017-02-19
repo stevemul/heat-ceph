@@ -1,0 +1,4 @@
+- hosts: localhost
+  tasks:
+  - name: Set IP address on eth1
+    shell: ip addr add _ipaddr_ dev eth1

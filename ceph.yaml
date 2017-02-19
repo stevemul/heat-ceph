@@ -1,0 +1,263 @@
+heat_template_version: 2016-04-08
+
+parameters:
+  flavor:
+    type: string
+    description: Flavor for the server to be created
+    default: t1.small
+    constraints:
+      - custom_constraint: nova.flavor
+  image:
+    type: string
+    description: Image ID or image name to use for the server
+    default: "rhel-7-LTS"
+    constraints:
+      - custom_constraint: glance.image
+  key_name:
+    type: string
+    description: SSH Key Pair
+    default: "venv-mac"
+    constraints:
+      - custom_constraint: nova.keypair
+  osd_scale:
+    type: number
+    description: Number of OSD nodes to deploy
+    default: 3
+  haproxy_scale:
+    type: number
+    description: Number of HAProxy nodes to deploy
+    default: 2
+  rgw_scale:
+    type: number
+    description: Number of RadosGW nodes to deploy
+    default: 2
+  mon_scale:
+    type: number
+    description: Number of RadosGW nodes to deploy
+    default: 3
+
+resources:
+  dmz_net:
+    type: network.yaml
+    properties:
+      net_name: dmz_net
+      allocation_pools: [{"start": "192.168.200.20", "end": "192.168.200.200"}]
+      cidr: "192.168.200.0/24"
+      dns: ["8.8.8.8"]
+      gateway: "192.168.200.1"
+
+  obj_gw_net:
+    type: network.yaml
+    properties:
+      net_name: obj_gw_net
+      allocation_pools: [{"start": "10.1.1.2", "end": "10.1.1.100"}]
+      cidr: "10.1.1.0/24"
+      dns: ["8.8.8.8"]
+      gateway: "10.1.1.1"
+
+  obj_client_net:
+    type: network.yaml
+    properties:
+      net_name: obj_client_net
+      allocation_pools: [{"start": "10.1.2.2", "end": "10.1.2.100"}]
+      cidr: "10.1.2.0/24"
+      dns: ["8.8.8.8"]
+      gateway: "10.1.2.1"
+
+  storage_net:
+    type: network.yaml
+    properties:
+      net_name: storage_net
+      allocation_pools: [{"start": "10.1.3.2", "end": "10.1.3.100"}]
+      cidr: "10.1.3.0/24"
+      dns: ["8.8.8.8"]
+      gateway: "10.1.3.1"
+
+  InternetGW:
+    type: OS::Neutron::Router
+    properties:
+      external_gateway_info: { network: Internet }
+      name: InternetGW
+
+  client_gw:
+    type: OS::Neutron::RouterInterface
+    properties:
+      router_id: { get_resource: InternetGW }
+      subnet: { get_attr: [ obj_client_net, subnet ] }
+
+  dmz_gw:
+    type: OS::Neutron::RouterInterface
+    properties:
+      router_id: { get_resource: InternetGW }
+      subnet:  { get_attr: [ dmz_net, subnet ] }
+
+  mgmt_port:
+    type: OS::Neutron::Port
+    properties:
+      network: { get_attr: [ dmz_net, network ] }
+      fixed_ips:
+      - subnet_id: { get_attr: [ dmz_net, subnet ] }
+      security_groups:
+        - default
+        - { get_resource: ssh_secgroup }
+
+  ceph_port:
+    type: OS::Neutron::Port
+    properties:
+      network: { get_attr: [ dmz_net, network ] }
+      fixed_ips:
+      - subnet_id: { get_attr: [ dmz_net, subnet ] }
+
+  mgmt_floating_ip:
+    type: OS::Neutron::FloatingIP
+    properties: 
+      floating_network: "Internet"
+
+  ceph_floating_ip:
+    type: OS::Neutron::FloatingIP
+    properties: 
+      floating_network: "Internet"
+
+  mgmt_floating_ip_assoc:
+    type: OS::Neutron::FloatingIPAssociation
+    properties:
+      floatingip_id: { get_resource: mgmt_floating_ip }
+      port_id: { get_resource: mgmt_port }
+
+  ceph_floating_ip_assoc:
+    type: OS::Neutron::FloatingIPAssociation
+    properties:
+      floatingip_id: { get_resource: ceph_floating_ip }
+      port_id: { get_resource: ceph_port }
+
+  ssh_secgroup:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      rules:
+        - protocol: tcp
+          remote_ip_prefix: 0.0.0.0/0
+          port_range_min: 22
+          port_range_max: 22
+
+  jumpbox:
+    type: OS::Nova::Server
+    depends_on: [ obj_client_net, mgmt_port ]
+    properties:
+      name: mgmt-jumpbox
+      flavor: { get_param: flavor }
+      image: { get_param: image }
+      key_name: { get_param: key_name }
+      networks:
+        - port: { get_resource: mgmt_port }
+        - network: { get_attr: [ obj_client_net, network ] }
+      user_data_format: SOFTWARE_CONFIG
+      user_data: { get_attr: [config_agent, config] }
+
+  config_agent:
+    type: collect-config-setup/install_config_agent_rhel7_yum.yaml
+
+  jumpbox_ansible_config:
+    type: OS::Heat::SoftwareConfig
+    properties:
+      group: ansible
+      config: 
+        str_replace:
+          template: { get_file: 'files/jumpbox-ansible.yaml' }
+          params:
+            _ipaddr_: { get_attr: [jumpbox, addresses, { get_attr: [ obj_client_net, network ] }, 0, addr ] }
+      outputs:
+      - name: result
+
+  deploy_jumpbox_ansible_config:
+    type: OS::Heat::SoftwareDeployment
+    depends_on: jumpbox
+    properties:
+      signal_transport: CFN_SIGNAL
+      config:
+        get_resource: jumpbox_ansible_config
+      server:
+        get_resource: jumpbox
+
+  haproxy_group:
+    type: OS::Heat::ResourceGroup
+    depends_on: [ dmz_net, obj_gw_net]
+    properties:
+      count: { get_param: haproxy_scale }
+      resource_def:
+        type: server.yaml
+        properties:
+          server_name: haproxy-%index%
+          flavor: { get_param: flavor }
+          image: { get_param: image }
+          key_name: { get_param: key_name }
+          networks:
+            - network: { get_attr: [ dmz_net, network ] }
+            - network: { get_attr: [ obj_gw_net, network ] }
+          test: "test"
+
+  radosgw_group:
+    type: OS::Heat::ResourceGroup
+    depends_on: [ obj_client_net, obj_gw_net]
+    properties:
+      count: { get_param: rgw_scale }
+      resource_def:
+        type: server.yaml
+        properties:
+          server_name: rgw-%index%
+          flavor: { get_param: flavor }
+          image: { get_param: image }
+          key_name: { get_param: key_name }
+          networks:
+            - network: { get_attr: [ obj_client_net, network ] }
+            - network: { get_attr: [ obj_gw_net, network ] }
+          test: "test"
+
+  osd_group:
+    type: OS::Heat::ResourceGroup
+    depends_on: [ obj_client_net, storage_net]
+    properties:
+      count: { get_param: osd_scale }
+      resource_def:
+        type: server.yaml
+        properties:
+          server_name: osd-%index%
+          flavor: { get_param: flavor }
+          image: { get_param: image }
+          key_name: { get_param: key_name }
+          networks:
+            - network: { get_attr: [ obj_client_net, network ] }
+            - network: { get_attr: [ storage_net, network ] }
+          test: "test"
+
+  mon_group:
+    type: OS::Heat::ResourceGroup
+    depends_on: [ obj_client_net, storage_net]
+    properties:
+      count: { get_param: mon_scale }
+      resource_def:
+        type: server.yaml
+        properties:
+          server_name: mon-%index%
+          flavor: { get_param: flavor }
+          image: { get_param: image }
+          key_name: { get_param: key_name }
+          networks:
+            - network: { get_attr: [ obj_client_net, network ] }
+            - network: { get_attr: [ storage_net, network ] }
+          test: "test"
+
+outputs:
+  jumpbox_IP_2:
+    value: { get_attr: [ jumpbox, addresses, { get_attr: [ obj_client_net, network ] }, 0, addr ] }
+  jumpbox_ext_ip:
+    description: External IP for connection to jump box.
+    value: { get_attr: [  mgmt_floating_ip, floating_ip_address ] }
+  osd_ips:
+    description: IPs of the OSDs
+    value: { get_attr: [ osd_group, server_ip ] }
+  mon_ips:
+    description: IPs of the MONs
+    value: { get_attr: [ radosgw_group, server_ip ] }
+  rgw_ips:
+    description: IPs of the RadosGWs
+    value: { get_attr: [ mon_group, server_ip ] }
